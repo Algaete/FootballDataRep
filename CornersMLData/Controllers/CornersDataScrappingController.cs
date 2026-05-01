@@ -21,6 +21,9 @@ namespace CornersMLData.Controllers
     public class CornersDataScrappingController : ControllerBase
     {
         private readonly IConfiguration _configuration;
+        private static readonly TimeSpan WorldFootballCooldownWindow = TimeSpan.FromMinutes(5);
+        private static readonly object WorldFootballCooldownLock = new();
+        private static DateTimeOffset? _worldFootballCooldownUntilUtc;
 
         public CornersDataScrappingController(IConfiguration configuration)
         {
@@ -40,6 +43,7 @@ namespace CornersMLData.Controllers
             if (take > 1000) take = 1000;
             if (parallelism <= 0) parallelism = 1;
             if (parallelism > 4) parallelism = 4;
+            var effectiveParallelism = Math.Min(parallelism, 3);
 
             using var conn = new SqlConnection(connStr);
             await conn.OpenAsync();
@@ -59,17 +63,24 @@ namespace CornersMLData.Controllers
 
             var sessionDir = Path.Combine(
                 Directory.GetCurrentDirectory(),
-                "wwwroot",
+                ".runtime",
                 "tmp",
-                "playwright-worldfootball-session");
+                $"playwright-worldfootball-session-{Environment.ProcessId}");
 
             Directory.CreateDirectory(sessionDir);
 
             var sharedContext = await playwright.Chromium.LaunchPersistentContextAsync(sessionDir, new BrowserTypeLaunchPersistentContextOptions
             {
+                Channel = "chrome",
                 Headless = false,
-                SlowMo = 100,
+                SlowMo = 50,
+                ChromiumSandbox = false,
                 ViewportSize = new ViewportSize
+                {
+                    Width = 1600,
+                    Height = 1000
+                },
+                ScreenSize = new ScreenSize
                 {
                     Width = 1600,
                     Height = 1000
@@ -77,14 +88,22 @@ namespace CornersMLData.Controllers
                 UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
                             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                 Locale = "en-US",
+                IgnoreHTTPSErrors = true,
                 Args = new[]
                 {
                     "--no-sandbox",
-                    "--disable-blink-features=AutomationControlled"
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--disable-dev-shm-usage",
+                    "--disable-background-networking",
+                    "--disable-background-timer-throttling",
+                    "--disable-renderer-backgrounding",
+                    "--start-maximized"
                 }
             });
+            PrepareWorldFootballContext(sharedContext);
 
-            var throttler = new SemaphoreSlim(parallelism, parallelism);
+            var throttler = new SemaphoreSlim(effectiveParallelism, effectiveParallelism);
             LineupProcessResult[] results;
 
             try
@@ -109,7 +128,7 @@ namespace CornersMLData.Controllers
 
             return Ok(new LineupBatchResponse
             {
-                Message = $"Claimed {pendingList.Count} partidos. Parallelism={parallelism}.",
+                Message = $"Claimed {pendingList.Count} partidos. Parallelism={parallelism}. EffectiveBrowserParallelism={effectiveParallelism}.",
                 Total = results.Length,
                 Completed = results.Count(x => x.Status == "COMPLETED"),
                 Failed = results.Count(x => x.Status == "FAILED"),
@@ -149,88 +168,123 @@ namespace CornersMLData.Controllers
             await using var conn = new SqlConnection(connStr);
             await conn.OpenAsync();
 
-            IPage? page = null;
             var awayRowInserted = false;
+            Exception? lastException = null;
 
-            try
+            Console.WriteLine("====================================");
+            Console.WriteLine($"PROCESANDO {index}/{totalBatch}");
+            Console.WriteLine($"LineupId: {row.LineupId}");
+            Console.WriteLine($"MatchId: {row.MatchId}");
+            Console.WriteLine($"League: {row.League}");
+            Console.WriteLine($"Local: {row.Team}");
+            Console.WriteLine($"Visita: {row.Opponent}");
+            Console.WriteLine($"Fecha: {row.MatchDate:yyyy-MM-dd}");
+            Console.WriteLine("====================================");
+
+            awayRowInserted = await EnsureAwayLineupExists(conn, row);
+
+            var debugFolder = EnsureDebugFolder();
+            var stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+
+            for (var attempt = 1; attempt <= 3; attempt++)
             {
-                Console.WriteLine("====================================");
-                Console.WriteLine($"PROCESANDO {index}/{totalBatch}");
-                Console.WriteLine($"LineupId: {row.LineupId}");
-                Console.WriteLine($"MatchId: {row.MatchId}");
-                Console.WriteLine($"League: {row.League}");
-                Console.WriteLine($"Local: {row.Team}");
-                Console.WriteLine($"Visita: {row.Opponent}");
-                Console.WriteLine($"Fecha: {row.MatchDate:yyyy-MM-dd}");
-                Console.WriteLine("====================================");
-
-                awayRowInserted = await EnsureAwayLineupExists(conn, row);
-
-                page = await context.NewPageAsync();
-
-                var debugFolder = EnsureDebugFolder();
-                var stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-
-                var matchupUrl = await ResolveWorldFootballMatchupUrlAsync(page, row);
-
-                if (string.IsNullOrWhiteSpace(matchupUrl))
-                    throw new Exception("No se pudo resolver la URL de matchup en WorldFootball.");
-
-                Console.WriteLine($"MATCHUP URL: {matchupUrl}");
-
-                var lineupUrl = await ResolveLineupUrlFromMatchupPageAsync(page, matchupUrl!, row);
-
-                if (string.IsNullOrWhiteSpace(lineupUrl))
-                    throw new Exception("No se pudo resolver la URL /lineup/ del partido.");
-
-                Console.WriteLine($"LINEUP URL: {lineupUrl}");
-
-                var scrape = await ExtractLineupDataFromWorldFootballAsync(page, lineupUrl!, row, debugFolder, stamp);
-
-                var homeStatus = !string.IsNullOrWhiteSpace(scrape.HomeFormation)
-                                 || !string.IsNullOrWhiteSpace(scrape.HomeCoach)
-                    ? "COMPLETED"
-                    : "FAILED";
-
-                var awayStatus = !string.IsNullOrWhiteSpace(scrape.AwayFormation)
-                                 || !string.IsNullOrWhiteSpace(scrape.AwayCoach)
-                    ? "COMPLETED"
-                    : "FAILED";
-
-                var updatedRows = await SaveScrapeResultAsync(conn, row, scrape, lineupUrl!, homeStatus, awayStatus);
-
-                Console.WriteLine($"OK MatchId {row.MatchId}");
-
-                return new LineupProcessResult
+                IPage? page = null;
+                try
                 {
-                    Index = index,
-                    TotalBatch = totalBatch,
-                    LineupId = row.LineupId,
-                    MatchId = row.MatchId,
-                    Team = row.Team,
-                    Opponent = row.Opponent,
-                    MatchDate = row.MatchDate,
-                    MatchupUrl = matchupUrl,
-                    LineupUrl = lineupUrl,
-                    HomeFormation = scrape.HomeFormation,
-                    AwayFormation = scrape.AwayFormation,
-                    HomeCoach = scrape.HomeCoach,
-                    AwayCoach = scrape.AwayCoach,
-                    AllFormations = scrape.AllFormations,
-                    AllCoachCandidates = scrape.AllCoachCandidates,
-                    DebugHtmlPath = scrape.DebugHtmlPath,
-                    DebugImagePath = scrape.DebugImagePath,
-                    HomeStatus = homeStatus,
-                    AwayStatus = awayStatus,
-                    Status = homeStatus == "COMPLETED" || awayStatus == "COMPLETED"
+                    if (attempt > 1)
+                        Console.WriteLine($"REINTENTO {attempt}/3 MatchId {row.MatchId}");
+
+                    page = await context.NewPageAsync();
+
+                    var matchupUrl = await ResolveWorldFootballMatchupUrlAsync(page, row);
+
+                    if (string.IsNullOrWhiteSpace(matchupUrl))
+                        throw new Exception("No se pudo resolver la URL de matchup en WorldFootball.");
+
+                    Console.WriteLine($"MATCHUP URL: {matchupUrl}");
+
+                    var lineupUrl = await ResolveLineupUrlFromMatchupPageAsync(page, matchupUrl!, row);
+
+                    if (string.IsNullOrWhiteSpace(lineupUrl))
+                        throw new Exception("No se pudo resolver la URL /lineup/ del partido.");
+
+                    Console.WriteLine($"LINEUP URL: {lineupUrl}");
+
+                    var scrape = await ExtractLineupDataFromWorldFootballAsync(page, lineupUrl!, row, debugFolder, stamp);
+
+                    var homeStatus = !string.IsNullOrWhiteSpace(scrape.HomeFormation)
+                                     || !string.IsNullOrWhiteSpace(scrape.HomeCoach)
                         ? "COMPLETED"
-                        : "FAILED",
-                    Database = BuildDatabaseWriteResult(awayRowInserted, updatedRows)
-                };
+                        : "FAILED";
+
+                    var awayStatus = !string.IsNullOrWhiteSpace(scrape.AwayFormation)
+                                     || !string.IsNullOrWhiteSpace(scrape.AwayCoach)
+                        ? "COMPLETED"
+                        : "FAILED";
+
+                    var updatedRows = await SaveScrapeResultAsync(conn, row, scrape, lineupUrl!, homeStatus, awayStatus);
+
+                    Console.WriteLine($"OK MatchId {row.MatchId}");
+
+                    return new LineupProcessResult
+                    {
+                        Index = index,
+                        TotalBatch = totalBatch,
+                        LineupId = row.LineupId,
+                        MatchId = row.MatchId,
+                        Team = row.Team,
+                        Opponent = row.Opponent,
+                        MatchDate = row.MatchDate,
+                        MatchupUrl = matchupUrl,
+                        LineupUrl = lineupUrl,
+                        HomeFormation = scrape.HomeFormation,
+                        AwayFormation = scrape.AwayFormation,
+                        HomeCoach = scrape.HomeCoach,
+                        AwayCoach = scrape.AwayCoach,
+                        AllFormations = scrape.AllFormations,
+                        AllCoachCandidates = scrape.AllCoachCandidates,
+                        DebugHtmlPath = scrape.DebugHtmlPath,
+                        DebugImagePath = scrape.DebugImagePath,
+                        HomeStatus = homeStatus,
+                        AwayStatus = awayStatus,
+                        Status = homeStatus == "COMPLETED" || awayStatus == "COMPLETED"
+                            ? "COMPLETED"
+                            : "FAILED",
+                        Database = BuildDatabaseWriteResult(awayRowInserted, updatedRows)
+                    };
+                }
+                catch (TaskCanceledException ex)
+                {
+                    lastException = ex;
+                    if (attempt < 3)
+                    {
+                        Console.WriteLine($"REINTENTABLE timeout MatchId {row.MatchId}: {ex.Message}");
+                        await Task.Delay(1500);
+                        continue;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lastException = ex;
+                    if (attempt < 3 && IsRetryableWorldFootballException(ex))
+                    {
+                        Console.WriteLine($"REINTENTABLE MatchId {row.MatchId}: {ex.Message}");
+                        await DelayBeforeWorldFootballRetryAsync();
+                        continue;
+                    }
+                }
+                finally
+                {
+                    if (page != null)
+                    {
+                        try { await page.CloseAsync(); } catch { }
+                    }
+                }
             }
-            catch (TaskCanceledException ex)
+
+            if (lastException is TaskCanceledException canceled)
             {
-                Console.WriteLine($"TASK CANCELADA MatchId {row.MatchId}: {ex.Message}");
+                Console.WriteLine($"TASK CANCELADA MatchId {row.MatchId}: {canceled.Message}");
 
                 var updatedRows = await MarkMatchAsErrorAsync(conn, row.MatchId, "FAILED");
 
@@ -243,38 +297,29 @@ namespace CornersMLData.Controllers
                     Team = row.Team,
                     Opponent = row.Opponent,
                     Error = "Task cancelada por timeout interno de Playwright o navegación.",
-                    Detail = ex.Message,
+                    Detail = canceled.Message,
                     Status = "CANCELED",
                     Database = BuildDatabaseWriteResult(awayRowInserted, updatedRows)
                 };
             }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"ERROR MatchId {row.MatchId}: {ex}");
 
-                var updatedRows = await MarkMatchAsErrorAsync(conn, row.MatchId, "ERROR");
+            Console.WriteLine($"ERROR MatchId {row.MatchId}: {lastException}");
 
-                return new LineupProcessResult
-                {
-                    Index = index,
-                    TotalBatch = totalBatch,
-                    LineupId = row.LineupId,
-                    MatchId = row.MatchId,
-                    Team = row.Team,
-                    Opponent = row.Opponent,
-                    Error = ex.Message,
-                    Detail = ex.ToString(),
-                    Status = "ERROR",
-                    Database = BuildDatabaseWriteResult(awayRowInserted, updatedRows)
-                };
-            }
-            finally
+            var finalUpdatedRows = await MarkMatchAsErrorAsync(conn, row.MatchId, "ERROR");
+
+            return new LineupProcessResult
             {
-                if (page != null)
-                {
-                    try { await page.CloseAsync(); } catch { }
-                }
-            }
+                Index = index,
+                TotalBatch = totalBatch,
+                LineupId = row.LineupId,
+                MatchId = row.MatchId,
+                Team = row.Team,
+                Opponent = row.Opponent,
+                Error = lastException?.Message,
+                Detail = lastException?.ToString(),
+                Status = "ERROR",
+                Database = BuildDatabaseWriteResult(awayRowInserted, finalUpdatedRows)
+            };
         }
 
         private static async Task<List<LineupRow>> ClaimPendingHomeLineupsAsync(SqlConnection conn, int take)
@@ -286,8 +331,22 @@ namespace CornersMLData.Controllers
                 SELECT TOP (@Take) LineupId
                 FROM dbo.Lineups WITH (UPDLOCK, READPAST, ROWLOCK, INDEX(IX_Lineups_Status))
                 WHERE IsHome = 1
-                  AND (ScrapingStatus IS NULL OR ScrapingStatus IN ('PENDING', 'FAILED', 'ERROR'))
+                  AND ScrapingStatus = 'PENDING'
                 ORDER BY
+                    CASE
+                        WHEN League LIKE '%2-bundesliga%' THEN 1
+                        ELSE 0
+                    END,
+                    CASE
+                        WHEN Team LIKE '%' + CHAR(10) + '%'
+                          OR Team LIKE '%' + CHAR(13) + '%'
+                          OR Opponent LIKE '%' + CHAR(10) + '%'
+                          OR Opponent LIKE '%' + CHAR(13) + '%'
+                          OR Team LIKE '% 2'
+                          OR Opponent LIKE '% 2'
+                        THEN 1
+                        ELSE 0
+                    END,
                     MatchDate DESC,
                     LineupId DESC;
 
@@ -363,6 +422,28 @@ namespace CornersMLData.Controllers
 
         private static async Task<string?> ResolveWorldFootballMatchupUrlAsync(IPage page, LineupRow row)
         {
+            var scheduleUrl = BuildWorldFootballAllMatchesUrl(row);
+            var scheduleMatchUrl = await ResolveWorldFootballMatchUrlFromCompetitionScheduleAsync(page, row);
+
+            if (!string.IsNullOrWhiteSpace(scheduleMatchUrl))
+            {
+                Console.WriteLine($"WORLDFOOTBALL SCHEDULE RESULT: {scheduleMatchUrl}");
+                return scheduleMatchUrl;
+            }
+
+            if (!string.IsNullOrWhiteSpace(scheduleUrl))
+            {
+                var directReportUrlForKnownLeague = BuildDirectWorldFootballReportUrl(row);
+                if (ShouldUseDirectReportFallback(row.League) && !string.IsNullOrWhiteSpace(directReportUrlForKnownLeague))
+                {
+                    Console.WriteLine($"WORLDFOOTBALL DIRECT REPORT FALLBACK: {directReportUrlForKnownLeague}");
+                    return directReportUrlForKnownLeague;
+                }
+
+                Console.WriteLine("WORLDFOOTBALL: calendario disponible pero sin match confiable; se evita fallback externo para no caer en 404 o errores de buscador.");
+                return null;
+            }
+
             var directReportUrl = BuildDirectWorldFootballReportUrl(row);
 
             if (!string.IsNullOrWhiteSpace(directReportUrl))
@@ -371,29 +452,19 @@ namespace CornersMLData.Controllers
                 return directReportUrl;
             }
 
-            var queries = BuildWorldFootballSiteSearchQueries(row);
-
-            foreach (var query in queries)
-            {
-                Console.WriteLine($"WORLDFOOTBALL SEARCH QUERY: {query}");
-
-                var directMatchReport = await ResolveWorldFootballMatchReportFromSiteSearchAsync(page, row, query);
-
-                if (!string.IsNullOrWhiteSpace(directMatchReport))
-                {
-                    Console.WriteLine($"WORLDFOOTBALL FIRST RESULT: {directMatchReport}");
-                    return directMatchReport;
-                }
-            }
-
             return null;
         }
 
-        private static async Task<string?> ResolveWorldFootballMatchReportFromSiteSearchAsync(IPage page, LineupRow row, string query)
+        private static async Task<string?> ResolveWorldFootballMatchUrlFromCompetitionScheduleAsync(IPage page, LineupRow row)
         {
-            var searchUrl = $"https://www.worldfootball.net/search/list/?q={Uri.EscapeDataString(query)}";
+            var scheduleUrl = BuildWorldFootballAllMatchesUrl(row);
+            if (string.IsNullOrWhiteSpace(scheduleUrl))
+                return null;
 
-            await page.GotoAsync(searchUrl, new PageGotoOptions
+            await WaitForWorldFootballCooldownAsync();
+            Console.WriteLine($"WORLDFOOTBALL SCHEDULE URL: {scheduleUrl}");
+
+            await page.GotoAsync(scheduleUrl, new PageGotoOptions
             {
                 WaitUntil = WaitUntilState.DOMContentLoaded,
                 Timeout = 45000
@@ -402,28 +473,59 @@ namespace CornersMLData.Controllers
             await EnsureWorldFootballVerificationClearedAsync(page);
             await page.WaitForTimeoutAsync(1500);
 
-            var hrefs = await page.EvaluateAsync<string[]>(@"
-                () => Array.from(document.querySelectorAll('a[href]'))
-                    .map(a => a.href)
-                    .filter(Boolean)
+            var candidates = await page.EvaluateAsync<ScheduleCandidateLink[]>(@"
+                () => {
+                    const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+                    const list = [];
+                    const matches = Array.from(document.querySelectorAll('.match[data-match_id], div.match[data-match_id]'));
+
+                    for (const match of matches) {
+                        const href =
+                            match.querySelector('.match-result a[href*=""/match-report/""]')?.href ||
+                            match.querySelector('.match-more a[href*=""/match-report/""]')?.href ||
+                            null;
+
+                        if (!href) continue;
+
+                        const home = clean(match.querySelector('.team-name-home')?.textContent || match.querySelector('.team-shortname-home')?.textContent);
+                        const away = clean(match.querySelector('.team-name-away')?.textContent || match.querySelector('.team-shortname-away')?.textContent);
+                        const isoDate = (match.getAttribute('data-datetime') || '').slice(0, 10);
+                        const uiDate = isoDate ? isoDate.split('-').reverse().join('.') : '';
+                        const visibleDate =
+                            clean(match.querySelector('.match-date')?.textContent || '') ||
+                            clean(match.querySelector('.date')?.textContent || '') ||
+                            clean(match.querySelector('[class*=""date""]')?.textContent || '');
+                        const rowText = clean([uiDate, visibleDate, home, away, clean(match.innerText)].filter(Boolean).join(' '));
+
+                        list.push({
+                            href,
+                            linkText: clean(match.querySelector('.match-result a')?.textContent || ''),
+                            rowText
+                        });
+                    }
+
+                    return list;
+                }
             ");
 
-            var ordered = hrefs
-                .Where(x => !string.IsNullOrWhiteSpace(x))
-                .Where(x => x.Contains("worldfootball.net", StringComparison.OrdinalIgnoreCase))
-                .Where(x =>
-                    x.Contains("/match-report/", StringComparison.OrdinalIgnoreCase)
-                    || x.Contains("/teams/", StringComparison.OrdinalIgnoreCase))
-                .Select(NormalizeSearchResultUrl)
-                .Where(x => !string.IsNullOrWhiteSpace(x))
-                .Distinct()
-                .OrderByDescending(x => ScoreCandidateUrl(x!, row))
-                .ToList();
+            var best = candidates
+                .Where(x => !string.IsNullOrWhiteSpace(x.Href))
+                .DistinctBy(x => x.Href)
+                .Select(x => new
+                {
+                    x.Href,
+                    Score = ScoreScheduleCandidate(x, row)
+                })
+                .Where(x => x.Score > 0)
+                .OrderByDescending(x => x.Score)
+                .Select(x => x.Href)
+                .FirstOrDefault();
 
-            if (!ordered.Any())
-                await SaveWorldFootballSearchDebugArtifactsAsync(page, query);
+            if (!string.IsNullOrWhiteSpace(best))
+                return best;
 
-            return ordered.FirstOrDefault();
+            await SaveWorldFootballSearchDebugArtifactsAsync(page, $"schedule_{row.League}_{row.Team}_{row.Opponent}_{row.MatchDate:yyyyMMdd}");
+            return null;
         }
 
         private static async Task SubmitWorldFootballSiteSearchAsync(IPage page, string query)
@@ -477,6 +579,14 @@ namespace CornersMLData.Controllers
                     var text = await page.EvaluateAsync<string>("() => document.body ? document.body.innerText : ''");
                     var html = await page.ContentAsync();
 
+                    var looksLikeRegularNotFoundPage =
+                        !string.IsNullOrWhiteSpace(title) && title.Contains("404", StringComparison.OrdinalIgnoreCase)
+                        && !string.IsNullOrWhiteSpace(text)
+                        && text.Contains("couldn't find the page", StringComparison.OrdinalIgnoreCase);
+
+                    if (looksLikeRegularNotFoundPage)
+                        return false;
+
                     return (!string.IsNullOrWhiteSpace(title) && (
                                 title.Contains("Just a moment", StringComparison.OrdinalIgnoreCase)
                                 || title.Contains("Un momento", StringComparison.OrdinalIgnoreCase)
@@ -501,20 +611,8 @@ namespace CornersMLData.Controllers
             if (!await IsVerificationPageAsync())
                 return;
 
-            Console.WriteLine("WORLDFOOTBALL: se detectó verificación de seguridad. Resuélvela manualmente en el navegador abierto.");
-
-            var startedAt = DateTime.UtcNow;
-            while ((DateTime.UtcNow - startedAt).TotalMilliseconds < timeoutMs)
-            {
-                await page.WaitForTimeoutAsync(2000);
-                if (!await IsVerificationPageAsync())
-                {
-                    Console.WriteLine("WORLDFOOTBALL: verificación resuelta, continuando.");
-                    return;
-                }
-            }
-
-            throw new Exception("WorldFootball mostró verificación de seguridad (Cloudflare) y no se resolvió dentro del tiempo de espera.");
+            TriggerWorldFootballCooldown("verificación de seguridad de WorldFootball");
+            throw new Exception("WorldFootball mostró verificación de seguridad y se activó un cooldown automático.");
         }
 
         private static async Task SaveWorldFootballSearchDebugArtifactsAsync(IPage page, string query)
@@ -544,25 +642,31 @@ namespace CornersMLData.Controllers
             }
         }
 
-        private static List<string> BuildWorldFootballSiteSearchQueries(LineupRow row)
+        private static async Task<bool> IsSearchEngineChallengePageAsync(IPage page)
         {
-            var dateIso = row.MatchDate?.ToString("yyyy-MM-dd") ?? "";
-            var dateAlt = row.MatchDate?.ToString("dd.MM.yyyy") ?? "";
-            var team = NormalizeForSearch(row.Team);
-            var opp = NormalizeForSearch(row.Opponent);
-            var league = NormalizeForSearch(row.League);
-            var season = NormalizeForSearch(row.Season);
-
-            var list = new List<string>
+            try
             {
-                $"{team} {opp} {dateAlt}",
-                $"{team} {opp} {dateIso}",
-                $"{team} {opp} {league} {season}",
-                $"{team} {opp} {league}",
-                $"{team} {opp}"
-            };
+                var title = await page.TitleAsync();
+                var text = await page.EvaluateAsync<string>("() => document.body ? document.body.innerText : ''");
+                var html = await page.ContentAsync();
 
-            return list.Distinct().ToList();
+                return (!string.IsNullOrWhiteSpace(title) && (
+                            title.Contains("One last step", StringComparison.OrdinalIgnoreCase)
+                            || title.Contains("Just a moment", StringComparison.OrdinalIgnoreCase)
+                            || title.Contains("Verify", StringComparison.OrdinalIgnoreCase)))
+                       || (!string.IsNullOrWhiteSpace(text) && (
+                            text.Contains("Please solve the challenge below to continue", StringComparison.OrdinalIgnoreCase)
+                            || text.Contains("cf-turnstile-response", StringComparison.OrdinalIgnoreCase)
+                            || text.Contains("security verification", StringComparison.OrdinalIgnoreCase)))
+                       || (!string.IsNullOrWhiteSpace(html) && (
+                            html.Contains("cf-turnstile-response", StringComparison.OrdinalIgnoreCase)
+                            || html.Contains("challenge/verify", StringComparison.OrdinalIgnoreCase)
+                            || html.Contains("turnstile", StringComparison.OrdinalIgnoreCase)));
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private static int ScoreCandidateUrl(string url, LineupRow row)
@@ -572,44 +676,95 @@ namespace CornersMLData.Controllers
 
             var score = 0;
             var normalizedUrl = RemoveDiacritics(url).ToLowerInvariant();
-            var team = RemoveDiacritics((row.Team ?? "").ToLowerInvariant());
-            var opp = RemoveDiacritics((row.Opponent ?? "").ToLowerInvariant());
+            if (ContainsTeamReference(normalizedUrl, row.Team)) score += 25;
+            if (ContainsTeamReference(normalizedUrl, row.Opponent)) score += 25;
 
-            foreach (var token in TokenizeTeamName(team))
-            {
-                if (normalizedUrl.Contains(token))
-                    score += 4;
-            }
-
-            foreach (var token in TokenizeTeamName(opp))
-            {
-                if (normalizedUrl.Contains(token))
-                    score += 4;
-            }
-
-            var league = RemoveDiacritics((row.League ?? "").ToLowerInvariant()).Replace(" ", "-");
+            var competitionVariants = BuildCompetitionReferenceVariants(row.League);
 
             if (normalizedUrl.Contains("worldfootball.net")) score += 10;
             if (normalizedUrl.Contains("/match-report/")) score += 30;
             if (normalizedUrl.Contains("/lineup/")) score += 25;
             if (normalizedUrl.Contains("/matches-against/")) score += 12;
             if (normalizedUrl.Contains("/teams/")) score += 8;
-            if (!string.IsNullOrWhiteSpace(league) && normalizedUrl.Contains(league)) score += 8;
+            if (competitionVariants.Any(variant => normalizedUrl.Contains(variant, StringComparison.OrdinalIgnoreCase))) score += 12;
+
+            return score;
+        }
+
+        private static List<string> BuildCompetitionReferenceVariants(string? league)
+        {
+            var variants = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var normalized = NormalizeCompetitionKey(league);
+
+            if (!string.IsNullOrWhiteSpace(normalized))
+            {
+                variants.Add(normalized);
+                variants.Add(normalized.Replace(" ", "-"));
+            }
+
+            var reportSlug = MapCompetitionToWorldFootballReportSlug(league);
+            if (!string.IsNullOrWhiteSpace(reportSlug))
+                variants.Add(reportSlug);
+
+            var allMatchesSlug = MapCompetitionToWorldFootballAllMatchesSlug(league);
+            if (!string.IsNullOrWhiteSpace(allMatchesSlug))
+            {
+                variants.Add(allMatchesSlug);
+
+                var countryAgnosticSlug = Regex.Replace(allMatchesSlug, @"^[a-z]{3}-", "");
+                variants.Add(countryAgnosticSlug);
+            }
+
+            return variants
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Select(x => NormalizeTeamKey(x).Replace(" ", "-"))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        private static int ScoreScheduleCandidate(ScheduleCandidateLink candidate, LineupRow row)
+        {
+            if (candidate == null || string.IsNullOrWhiteSpace(candidate.Href))
+                return 0;
+
+            var score = ScoreCandidateUrl(candidate.Href, row);
+            var rowText = RemoveDiacritics(candidate.RowText ?? "").ToLowerInvariant();
+            var linkText = RemoveDiacritics(candidate.LinkText ?? "").ToLowerInvariant();
+
+            if (row.MatchDate.HasValue)
+            {
+                var date1 = row.MatchDate.Value.ToString("dd/MM/yyyy").ToLowerInvariant();
+                var date2 = row.MatchDate.Value.ToString("d/M/yyyy").ToLowerInvariant();
+                var date3 = row.MatchDate.Value.ToString("dd.MM.yyyy").ToLowerInvariant();
+                var date4 = row.MatchDate.Value.ToString("d.M.yyyy").ToLowerInvariant();
+                var dateIso = row.MatchDate.Value.ToString("yyyy-MM-dd").ToLowerInvariant();
+                if (rowText.Contains(date1) || rowText.Contains(date2) || rowText.Contains(date3) || rowText.Contains(date4) || rowText.Contains(dateIso))
+                    score += 40;
+            }
+
+            if (ContainsTeamReference(rowText, row.Team)) score += 35;
+            if (ContainsTeamReference(rowText, row.Opponent)) score += 35;
+            if (ContainsTeamReference(linkText, row.Team)) score += 10;
+            if (ContainsTeamReference(linkText, row.Opponent)) score += 10;
+            if ((ContainsTeamReference(rowText, row.Team) && !ContainsTeamReference(rowText, row.Opponent))
+                || (!ContainsTeamReference(rowText, row.Team) && ContainsTeamReference(rowText, row.Opponent)))
+                score -= 40;
 
             return score;
         }
 
         private static async Task<string?> ResolveLineupUrlFromMatchupPageAsync(IPage page, string matchupOrMatchReportUrl, LineupRow row)
         {
-            // Si ya es match-report, forzamos directo a /lineup/
+            // La pagina report suele contener el detalle suficiente y evita 404
+            // frecuentes en variantes /lineup/ para algunas ligas y copas.
             if (matchupOrMatchReportUrl.Contains("/match-report/", StringComparison.OrdinalIgnoreCase))
             {
-                return ToLineupUrl(matchupOrMatchReportUrl);
+                return NormalizeWorldFootballReportUrl(matchupOrMatchReportUrl);
             }
 
             if (matchupOrMatchReportUrl.Contains("/report/", StringComparison.OrdinalIgnoreCase))
             {
-                return ToLineupUrl(matchupOrMatchReportUrl);
+                return NormalizeWorldFootballReportUrl(matchupOrMatchReportUrl);
             }
 
             await page.GotoAsync(matchupOrMatchReportUrl, new PageGotoOptions
@@ -673,39 +828,35 @@ namespace CornersMLData.Controllers
                 lineupUrl = best;
             }
 
-            return string.IsNullOrWhiteSpace(lineupUrl) ? null : ToLineupUrl(lineupUrl);
+            return string.IsNullOrWhiteSpace(lineupUrl) ? null : NormalizeWorldFootballReportUrl(lineupUrl);
         }
 
-        private static string ToLineupUrl(string url)
+        private static string NormalizeWorldFootballReportUrl(string url)
         {
             if (string.IsNullOrWhiteSpace(url))
                 return url;
 
             var clean = url.Split('?')[0].Split('#')[0];
 
-            if (clean.EndsWith("/lineup/", StringComparison.OrdinalIgnoreCase))
-                return clean;
+            if (clean.Contains("/match-report/", StringComparison.OrdinalIgnoreCase))
+                return clean.EndsWith("/") ? clean : clean + "/";
+
+            clean = clean.Replace("/lineup/", "/", StringComparison.OrdinalIgnoreCase);
 
             if (clean.EndsWith("/head-to-head/", StringComparison.OrdinalIgnoreCase))
-                return clean.Replace("/head-to-head/", "/lineup/", StringComparison.OrdinalIgnoreCase);
+                return clean.Replace("/head-to-head/", "/", StringComparison.OrdinalIgnoreCase);
 
             if (clean.EndsWith("/standings/", StringComparison.OrdinalIgnoreCase))
-                return clean.Replace("/standings/", "/lineup/", StringComparison.OrdinalIgnoreCase);
+                return clean.Replace("/standings/", "/", StringComparison.OrdinalIgnoreCase);
 
             if (clean.Contains("/match-report/", StringComparison.OrdinalIgnoreCase))
             {
-                if (!clean.EndsWith("/"))
-                    clean += "/";
-
-                return clean + "lineup/";
+                return clean.EndsWith("/") ? clean : clean + "/";
             }
 
             if (clean.Contains("/report/", StringComparison.OrdinalIgnoreCase))
             {
-                if (!clean.EndsWith("/"))
-                    clean += "/";
-
-                return clean + "lineup/";
+                return clean.EndsWith("/") ? clean : clean + "/";
             }
 
             return clean;
@@ -727,8 +878,12 @@ namespace CornersMLData.Controllers
             await EnsureWorldFootballVerificationClearedAsync(page);
             await page.WaitForTimeoutAsync(2500);
 
+            var title = await page.TitleAsync();
             var html = await page.ContentAsync();
             var visibleText = await page.EvaluateAsync<string>("() => document.body ? document.body.innerText : ''");
+
+            if (LooksLikeWorldFootballNotFoundPage(title, visibleText))
+                throw new Exception($"WorldFootball devolvio 404 para la URL de lineup/report: {lineupUrl}");
 
             var allFormations = ExtractValidFormations(visibleText)
                 .Concat(ExtractValidFormations(html))
@@ -949,7 +1104,7 @@ namespace CornersMLData.Controllers
         {
             var folder = Path.Combine(
                 Directory.GetCurrentDirectory(),
-                "wwwroot",
+                ".runtime",
                 "tmp",
                 "lineups-debug"
             );
@@ -961,6 +1116,12 @@ namespace CornersMLData.Controllers
         private static string? NullIfWhite(string? value)
         {
             return string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+        }
+
+        private static void PrepareWorldFootballContext(IBrowserContext context)
+        {
+            context.SetDefaultTimeout(45000);
+            context.SetDefaultNavigationTimeout(45000);
         }
 
         private static string NormalizeForSearch(string? value)
@@ -977,6 +1138,59 @@ namespace CornersMLData.Controllers
             s = Regex.Replace(s, @"\s+", " ");
 
             return s;
+        }
+
+        private static void TriggerWorldFootballCooldown(string reason)
+        {
+            var until = DateTimeOffset.UtcNow.Add(WorldFootballCooldownWindow);
+
+            lock (WorldFootballCooldownLock)
+            {
+                if (!_worldFootballCooldownUntilUtc.HasValue || _worldFootballCooldownUntilUtc.Value < until)
+                    _worldFootballCooldownUntilUtc = until;
+            }
+
+            Console.WriteLine($"WORLDFOOTBALL COOLDOWN ACTIVADO hasta {until:O}. Motivo: {reason}");
+        }
+
+        private static TimeSpan GetRemainingWorldFootballCooldown()
+        {
+            lock (WorldFootballCooldownLock)
+            {
+                if (!_worldFootballCooldownUntilUtc.HasValue)
+                    return TimeSpan.Zero;
+
+                var remaining = _worldFootballCooldownUntilUtc.Value - DateTimeOffset.UtcNow;
+                if (remaining <= TimeSpan.Zero)
+                {
+                    _worldFootballCooldownUntilUtc = null;
+                    return TimeSpan.Zero;
+                }
+
+                return remaining;
+            }
+        }
+
+        private static async Task WaitForWorldFootballCooldownAsync()
+        {
+            var remaining = GetRemainingWorldFootballCooldown();
+            if (remaining <= TimeSpan.Zero)
+                return;
+
+            Console.WriteLine($"WORLDFOOTBALL COOLDOWN EN CURSO: esperando {remaining.TotalSeconds:F0}s antes de volver a intentar.");
+            await Task.Delay(remaining + TimeSpan.FromSeconds(1));
+        }
+
+        private static async Task DelayBeforeWorldFootballRetryAsync()
+        {
+            var remaining = GetRemainingWorldFootballCooldown();
+            if (remaining > TimeSpan.Zero)
+            {
+                await WaitForWorldFootballCooldownAsync();
+                return;
+            }
+
+            await Task.Delay(2000);
         }
 
         private static string? BuildDirectWorldFootballReportUrl(LineupRow row)
@@ -997,20 +1211,146 @@ namespace CornersMLData.Controllers
             return $"https://www.worldfootball.net/report/{competitionSlug}-{seasonSlug}-{homeSlug}-{awaySlug}/";
         }
 
+        private static bool ShouldUseDirectReportFallback(string? league)
+        {
+            var key = NormalizeCompetitionKey(league);
+
+            return key is "bundesliga"
+                or "2 bundesliga"
+                or "dfb pokal"
+                or "laliga"
+                or "segunda division"
+                or "copa del rey";
+        }
+
+        private static string? BuildWorldFootballAllMatchesUrl(LineupRow row)
+        {
+            var seasonSlug = BuildSeasonSlug(row);
+            var key = NormalizeCompetitionKey(row.League);
+
+            if (string.IsNullOrWhiteSpace(seasonSlug))
+                return null;
+
+            if (key == "bundesliga")
+                return $"https://www.worldfootball.net/all_matches/bundesliga/bundesliga-{seasonSlug}/";
+
+            var competitionSlug = MapCompetitionToWorldFootballAllMatchesSlug(row.League);
+            if (string.IsNullOrWhiteSpace(competitionSlug))
+                return null;
+
+            return $"https://www.worldfootball.net/all_matches/{competitionSlug}-{seasonSlug}/";
+        }
+
         private static string? MapCompetitionToWorldFootballReportSlug(string? league)
         {
-            var key = NormalizeTeamKey(league ?? "");
+            var key = NormalizeCompetitionKey(league);
 
             return key switch
             {
                 "bundesliga" => "bundesliga",
                 "2 bundesliga" => "2-bundesliga",
                 "dfb pokal" => "dfb-pokal",
+                "premier league" => "premier-league",
+                "championship" => "championship",
+                "fa cup" => "fa-cup",
+                "league cup" => "league-cup",
                 "serie a" => "serie-a",
                 "serie b" => "serie-b",
                 "coppa italia" => "coppa-italia",
                 "ligue 1" => "ligue-1",
+                "ligue 2" => "ligue-2",
+                "coupe de france" => "coupe-de-france",
+                "laliga" => "primera-division",
+                "segunda division" => "segunda-division",
+                "copa del rey" => "copa-del-rey",
                 _ => null
+            };
+        }
+
+        private static string? MapCompetitionToWorldFootballAllMatchesSlug(string? league)
+        {
+            var key = NormalizeCompetitionKey(league);
+
+            return key switch
+            {
+                "bundesliga" => "bundesliga",
+                "2 bundesliga" => "2-bundesliga",
+                "dfb pokal" => "dfb-pokal",
+                "premier league" => "eng-premier-league",
+                "championship" => "eng-championship",
+                "fa cup" => "eng-fa-cup",
+                "league cup" => "eng-league-cup",
+                "serie a" => "ita-serie-a",
+                "serie b" => "ita-serie-b",
+                "coppa italia" => "ita-coppa-italia",
+                "ligue 1" => "fra-ligue-1",
+                "ligue 2" => "fra-ligue-2",
+                "coupe de france" => "fra-coupe-de-france",
+                "laliga" => "esp-primera-division",
+                "segunda division" => "esp-segunda-division",
+                "copa del rey" => "esp-copa-del-rey",
+                _ => null
+            };
+        }
+
+        private static string NormalizeCompetitionKey(string? league)
+        {
+            var key = NormalizeTeamKey(league ?? "");
+
+            return key switch
+            {
+                "1 bundesliga" => "bundesliga",
+                "germany bundesliga" => "bundesliga",
+                "german bundesliga" => "bundesliga",
+                "bundesliga germany" => "bundesliga",
+                "2 bundesliga germany" => "2 bundesliga",
+                "germany 2 bundesliga" => "2 bundesliga",
+                "2 bundesliga men" => "2 bundesliga",
+                "2 bundesliga german" => "2 bundesliga",
+                "2 bundesliga germany men" => "2 bundesliga",
+                "dfb pokal germany" => "dfb pokal",
+                "germany dfb pokal" => "dfb pokal",
+                "german cup" => "dfb pokal",
+                "england premier league" => "premier league",
+                "english premier league" => "premier league",
+                "england championship" => "championship",
+                "efl championship" => "championship",
+                "english championship" => "championship",
+                "england fa cup" => "fa cup",
+                "english fa cup" => "fa cup",
+                "efl cup" => "league cup",
+                "carabao cup" => "league cup",
+                "england league cup" => "league cup",
+                "english league cup" => "league cup",
+                "italy serie a" => "serie a",
+                "serie a italy" => "serie a",
+                "italy serie b" => "serie b",
+                "serie b italy" => "serie b",
+                "coppa italia italy" => "coppa italia",
+                "france ligue 1" => "ligue 1",
+                "ligue 1 france" => "ligue 1",
+                "france ligue 2" => "ligue 2",
+                "ligue 2 france" => "ligue 2",
+                "france coupe de france" => "coupe de france",
+                "coupe de france france" => "coupe de france",
+                "la liga" => "laliga",
+                "laliga santander" => "laliga",
+                "laliga ea sports" => "laliga",
+                "spain laliga" => "laliga",
+                "spain la liga" => "laliga",
+                "spanish la liga" => "laliga",
+                "primera division" => "laliga",
+                "spain primera division" => "laliga",
+                "segunda division" => "segunda division",
+                "laliga 2" => "segunda division",
+                "laliga2" => "segunda division",
+                "segunda division spain" => "segunda division",
+                "spain segunda division" => "segunda division",
+                "la liga 2" => "segunda division",
+                "copa del rey spain" => "copa del rey",
+                "spain copa del rey" => "copa del rey",
+                "spanish cup" => "copa del rey",
+                _ => key
             };
         }
 
@@ -1052,10 +1392,16 @@ namespace CornersMLData.Controllers
             {
                 "alemannia aachen" => "alemannia-aachen",
                 "ac milan" => "ac-milan",
+                "alaves" => "cd-alaves",
                 "arminia bielefeld" => "arminia-bielefeld",
                 "angers" => "angers-sco",
                 "as roma" => "as-roma",
+                "athletic bilbao" => "athletic-bilbao",
+                "athletic club" => "athletic-bilbao",
+                "atletico madrid" => "atletico-madrid",
                 "atalanta" => "atalanta-bc",
+                "aue" => "erzgebirge-aue",
+                "erzgebirge aue" => "erzgebirge-aue",
                 "auxerre" => "aj-auxerre",
                 "augsburg" => "fc-augsburg",
                 "avellino" => "us-avellino-1912",
@@ -1065,15 +1411,18 @@ namespace CornersMLData.Controllers
                 "monchengladbach" => "bor-moenchengladbach",
                 "bayer leverkusen" => "bayer-leverkusen",
                 "bayern munich" => "bayern-munich",
+                "barcelona" => "fc-barcelona",
                 "bologna" => "bologna-fc-1909",
                 "bochum" => "vfl-bochum",
                 "braunschweig" => "eintracht-braunschweig",
                 "bremen" => "bremer-sv",
                 "brescia" => "brescia-calcio",
                 "brest" => "stade-brestois-29",
+                "cadiz" => "cadiz-cf",
                 "cottbus" => "energie-cottbus",
                 "carrarese" => "carrarese-calcio",
                 "catanzaro" => "us-catanzaro",
+                "celta vigo" => "rc-celta",
                 "cesena" => "cesena-fc",
                 "cagliari" => "cagliari-calcio",
                 "cittadella" => "as-cittadella",
@@ -1084,6 +1433,8 @@ namespace CornersMLData.Controllers
                 "dortmund" => "borussia-dortmund",
                 "duisburg" => "msv-duisburg",
                 "dusseldorf" => "fortuna-duesseldorf",
+                "elche" => "elche-cf",
+                "espanyol" => "espanyol-barcelona",
                 "eintracht frankfurt" => "eintracht-frankfurt",
                 "elversberg" => "sv-07-elversberg",
                 "empoli" => "empoli-fc",
@@ -1093,7 +1444,10 @@ namespace CornersMLData.Controllers
                 "freiburg" => "sc-freiburg",
                 "frosinone" => "frosinone-calcio",
                 "genoa" => "genoa-cfc",
+                "getafe" => "getafe-cf",
                 "greifswald" => "greifswalder-fc",
+                "girona" => "girona-fc",
+                "granada" => "granada-cf",
                 "greuther furth" => "spvgg-greuther-fuerth",
                 "greuther fuerth" => "spvgg-greuther-fuerth",
                 "hallescher" => "hallescher-fc",
@@ -1111,10 +1465,12 @@ namespace CornersMLData.Controllers
                 "juventus" => "juventus",
                 "kaiserslautern" => "1-fc-kaiserslautern",
                 "karlsruher sc" => "karlsruher-sc",
+                "las palmas" => "ud-las-palmas",
                 "lazio" => "lazio-rom",
                 "le havre" => "le-havre-ac",
                 "lecce" => "us-lecce",
                 "lens" => "rc-lens",
+                "levante" => "levante-ud",
                 "lille" => "losc-lille",
                 "lotte" => "sportfreunde-lotte",
                 "lyon" => "olympique-lyonnais",
@@ -1122,6 +1478,7 @@ namespace CornersMLData.Controllers
                 "magdeburg" => "1-fc-magdeburg",
                 "mantova" => "mantova-1911",
                 "marseille" => "olympique-marseille",
+                "mallorca" => "rcd-mallorca",
                 "meppen" => "sv-meppen",
                 "monaco" => "as-monaco",
                 "modena" => "modena-fc-2018",
@@ -1134,6 +1491,7 @@ namespace CornersMLData.Controllers
                 "nice" => "ogc-nice",
                 "nurnberg" => "1-fc-nuernberg",
                 "offenbach" => "kickers-offenbach",
+                "osasuna" => "ca-osasuna",
                 "paderborn" => "sc-paderborn-07",
                 "palermo" => "palermo-fc",
                 "parma" => "parma-calcio-1913",
@@ -1142,7 +1500,13 @@ namespace CornersMLData.Controllers
                 "pisa" => "pisa-sc",
                 "preussen munster" => "sc-preussen-muenster",
                 "psg" => "paris-saint-germain",
+                "rayo vallecano" => "rayo-vallecano",
                 "rb leipzig" => "rb-leipzig",
+                "real betis" => "real-betis",
+                "betis" => "real-betis",
+                "real madrid" => "real-madrid",
+                "real sociedad" => "real-sociedad",
+                "real valladolid" => "real-valladolid",
                 "reggiana" => "ac-reggiana-1919",
                 "regensburg" => "jahn-regensburg",
                 "reims" => "stade-reims",
@@ -1156,6 +1520,7 @@ namespace CornersMLData.Controllers
                 "schalke" => "fc-schalke-04",
                 "schott mainz" => "tsv-schott-mainz",
                 "sg dynamo dresden" => "dynamo-dresden",
+                "sevilla" => "sevilla-fc",
                 "spezia" => "spezia-calcio",
                 "st pauli" => "fc-st-pauli",
                 "st etienne" => "as-st-etienne",
@@ -1170,11 +1535,13 @@ namespace CornersMLData.Controllers
                 "unterhaching" => "spvgg-unterhaching",
                 "udinese" => "udinese-calcio",
                 "ulm" => "ssv-ulm-1846",
+                "valencia" => "valencia-cf",
                 "venezia" => "venezia-fc",
                 "verona" => "hellas-verona",
                 "vfl osnabruck" => "vfl-osnabrueck",
                 "viktoria berlin" => "fc-viktoria-1889-berlin",
                 "villingen" => "fc-08-villingen",
+                "villarreal" => "villarreal-cf",
                 "wehen" => "sv-wehen-wiesbaden",
                 "werder bremen" => "werder-bremen",
                 "wolfsburg" => "vfl-wolfsburg",
@@ -1185,14 +1552,110 @@ namespace CornersMLData.Controllers
 
         private static string NormalizeTeamKey(string value)
         {
-            var normalized = RemoveDiacritics(value)
+            var sanitized = SanitizeTeamLabel(value);
+
+            var normalized = RemoveDiacritics(sanitized)
                 .ToLowerInvariant()
                 .Replace(".", " ")
                 .Replace("-", " ");
 
             normalized = Regex.Replace(normalized, @"\s+", " ").Trim();
-            normalized = Regex.Replace(normalized, @"\b[23]$", "").Trim();
             return normalized;
+        }
+
+        private static string SanitizeTeamLabel(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return value;
+
+            var hadControlChars = value.IndexOfAny(new[] { '\r', '\n', '\t' }) >= 0;
+
+            var sanitized = value
+                .Replace('\r', ' ')
+                .Replace('\n', ' ')
+                .Replace('\t', ' ');
+
+            sanitized = Regex.Replace(sanitized, @"\s+", " ").Trim();
+
+            if (hadControlChars)
+                sanitized = Regex.Replace(sanitized, @"\s+\d+\s*$", "");
+
+            return sanitized.Trim();
+        }
+
+        private static bool ContainsTeamReference(string? text, string? teamName)
+        {
+            if (string.IsNullOrWhiteSpace(text) || string.IsNullOrWhiteSpace(teamName))
+                return false;
+
+            var normalizedText = NormalizeTeamKey(text);
+            var variants = BuildTeamReferenceVariants(teamName);
+
+            foreach (var variant in variants)
+            {
+                if (string.IsNullOrWhiteSpace(variant))
+                    continue;
+
+                if (normalizedText.Contains(variant, StringComparison.OrdinalIgnoreCase))
+                    return true;
+
+                var tokens = TokenizeTeamName(variant);
+                if (tokens.Count >= 2 && tokens.Count(t => normalizedText.Contains(t, StringComparison.OrdinalIgnoreCase)) >= Math.Min(2, tokens.Count))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static List<string> BuildTeamReferenceVariants(string? teamName)
+        {
+            var variants = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var normalized = NormalizeTeamKey(teamName ?? "");
+
+            if (!string.IsNullOrWhiteSpace(normalized))
+                variants.Add(normalized);
+
+            var slug = MapTeamToWorldFootballReportSlug(teamName);
+            if (!string.IsNullOrWhiteSpace(slug))
+            {
+                variants.Add(slug.Replace("-", " "));
+                variants.Add(NormalizeTeamKey(slug.Replace("-", " ")));
+            }
+
+            foreach (var alias in ExpandCommonTeamAliases(normalized))
+                variants.Add(alias);
+
+            return variants
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Select(x => NormalizeTeamKey(x))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        private static IEnumerable<string> ExpandCommonTeamAliases(string normalized)
+        {
+            if (string.IsNullOrWhiteSpace(normalized))
+                yield break;
+
+            yield return Regex.Replace(normalized, @"\b(fc|cf|sv|as|ac|ssc|us|vfl|vfb|borussia|eintracht|spvgg|tsg|sc)\b", " ").Trim();
+
+            if (normalized.Contains("koln")) yield return normalized.Replace("koln", "koeln");
+            if (normalized.Contains("koeln")) yield return normalized.Replace("koeln", "koln");
+            if (normalized.Contains("nurnberg")) yield return normalized.Replace("nurnberg", "nuernberg");
+            if (normalized.Contains("nuernberg")) yield return normalized.Replace("nuernberg", "nurnberg");
+            if (normalized.Contains("munich")) yield return normalized.Replace("munich", "muenchen");
+            if (normalized.Contains("muenchen")) yield return normalized.Replace("muenchen", "munich");
+            if (normalized.Contains("munich")) yield return normalized.Replace("munich", "munchen");
+            if (normalized.Contains("munchen")) yield return normalized.Replace("munchen", "munich");
+            if (normalized.Contains("muenchen")) yield return normalized.Replace("muenchen", "munchen");
+            if (normalized.Contains("munchen")) yield return normalized.Replace("munchen", "muenchen");
+            if (normalized.Contains("hertha berlin")) yield return "hertha bsc";
+            if (normalized.Contains("hamburger sv")) yield return "hamburg";
+            if (normalized == "aue") yield return "erzgebirge aue";
+            if (normalized.Contains("erzgebirge aue")) yield return "aue";
+            if (normalized.Contains("fc koln")) yield return "1 fc koln";
+            if (normalized.Contains("fc koln")) yield return "1 fc koeln";
+            if (normalized.Contains("braunschweig")) yield return "eintracht braunschweig";
         }
 
         private static string RemoveDiacritics(string text)
@@ -1271,6 +1734,37 @@ namespace CornersMLData.Controllers
             return sum == 10;
         }
 
+        private static bool IsRetryableWorldFootballException(Exception ex)
+        {
+            var message = ex.ToString();
+
+            return ex is PlaywrightException
+                || message.Contains("Cloudflare", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("security verification", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("ERR_CONNECTION_CLOSED", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("ERR_CONNECTION_RESET", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("ERR_CONNECTION_REFUSED", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("ERR_TIMED_OUT", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("ERR_ABORTED", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("Failed to open a new tab", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("Target.createTarget", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("Target page, context or browser has been closed", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("No se pudo resolver la URL de matchup", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("WorldFootball devolvio 404", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool LooksLikeWorldFootballNotFoundPage(string? title, string? text)
+        {
+            if (string.IsNullOrWhiteSpace(title) && string.IsNullOrWhiteSpace(text))
+                return false;
+
+            return (!string.IsNullOrWhiteSpace(title) && title.Contains("404", StringComparison.OrdinalIgnoreCase))
+                || (!string.IsNullOrWhiteSpace(text) && (
+                    text.Contains("couldn't find the page", StringComparison.OrdinalIgnoreCase)
+                    || text.Contains("nicht gefunden", StringComparison.OrdinalIgnoreCase)
+                ));
+        }
+
         private static string? MatchFormationByTeamName(string? teamName, Dictionary<string, string> map)
         {
             if (string.IsNullOrWhiteSpace(teamName) || map == null || !map.Any())
@@ -1283,7 +1777,7 @@ namespace CornersMLData.Controllers
             {
                 var key = RemoveDiacritics(kv.Key).ToLowerInvariant();
 
-                if (key.Contains(normalizedTeam) || normalizedTeam.Contains(key))
+                if (ContainsTeamReference(key, normalizedTeam) || ContainsTeamReference(normalizedTeam, key))
                     return kv.Value;
             }
 
@@ -1292,8 +1786,9 @@ namespace CornersMLData.Controllers
                 .Select(kv => new
                 {
                     kv.Value,
-                    Score = TokenizeTeamName(normalizedTeam)
-                        .Count(t => RemoveDiacritics(kv.Key).ToLowerInvariant().Contains(t))
+                    Score = BuildTeamReferenceVariants(normalizedTeam)
+                        .Max(variant => TokenizeTeamName(variant)
+                            .Count(t => RemoveDiacritics(kv.Key).ToLowerInvariant().Contains(t)))
                 })
                 .OrderByDescending(x => x.Score)
                 .FirstOrDefault();
@@ -1409,6 +1904,13 @@ namespace CornersMLData.Controllers
             public List<string> AllCoachCandidates { get; set; } = new();
             public string? DebugHtmlPath { get; set; }
             public string? DebugImagePath { get; set; }
+        }
+
+        private class ScheduleCandidateLink
+        {
+            public string? Href { get; set; }
+            public string? LinkText { get; set; }
+            public string? RowText { get; set; }
         }
 
         private class LineupRow

@@ -10,6 +10,7 @@ _codex_tmp_playwright_check/
 CornersMLData/bin/
 CornersMLData/obj/
 CornersMLData/wwwroot/tmp/
+CornersMLData/.runtime/
 
 *.user
 *.suo
