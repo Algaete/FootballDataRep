@@ -48,7 +48,7 @@ namespace CornersMLData.Controllers
             using var conn = new SqlConnection(connStr);
             await conn.OpenAsync();
 
-            var pendingList = (await ClaimPendingHomeLineupsAsync(conn, take)).ToList();
+            var pendingList = (await ClaimPendingLineupsAsync(conn, take)).ToList();
 
             if (!pendingList.Any())
             {
@@ -135,6 +135,37 @@ namespace CornersMLData.Controllers
                 Errors = results.Count(x => x.Status == "ERROR"),
                 Canceled = results.Count(x => x.Status == "CANCELED"),
                 Results = results.OrderBy(x => x.Index).ToList()
+            });
+        }
+
+        [HttpPost("requeue-lineups-worldfootball")]
+        [ProducesResponseType(typeof(RequeueBatchResponse), StatusCodes.Status200OK)]
+        public async Task<IActionResult> RequeueLineupsWorldFootball([FromQuery] string fromStatus = "FAILED", [FromQuery] int take = 1000)
+        {
+            var connStr = _configuration.GetConnectionString("DefaultConnection");
+
+            if (string.IsNullOrWhiteSpace(connStr))
+                return Problem("Connection string 'DefaultConnection' is not configured.");
+
+            if (take <= 0) take = 1000;
+            if (take > 5000) take = 5000;
+
+            var normalizedStatus = (fromStatus ?? string.Empty).Trim().ToUpperInvariant();
+            if (string.IsNullOrWhiteSpace(normalizedStatus))
+                normalizedStatus = "FAILED";
+
+            using var conn = new SqlConnection(connStr);
+            await conn.OpenAsync();
+
+            var updatedRows = await RequeueMatchesByStatusAsync(conn, normalizedStatus, take);
+
+            return Ok(new RequeueBatchResponse
+            {
+                Message = $"Reencolados partidos con estado {normalizedStatus}.",
+                FromStatus = normalizedStatus,
+                ToStatus = "PENDING",
+                Requested = take,
+                UpdatedRows = updatedRows
             });
         }
 
@@ -322,54 +353,86 @@ namespace CornersMLData.Controllers
             };
         }
 
-        private static async Task<List<LineupRow>> ClaimPendingHomeLineupsAsync(SqlConnection conn, int take)
+        private static async Task<List<LineupRow>> ClaimPendingLineupsAsync(SqlConnection conn, int take)
         {
             var rows = await conn.QueryAsync<LineupRow>(@"
-                DECLARE @Claimed TABLE (LineupId INT PRIMARY KEY);
+                DECLARE @ClaimedMatches TABLE
+                (
+                    MatchId INT PRIMARY KEY,
+                    RepresentativeLineupId INT NOT NULL
+                );
 
-                INSERT INTO @Claimed (LineupId)
-                SELECT TOP (@Take) LineupId
-                FROM dbo.Lineups WITH (UPDLOCK, READPAST, ROWLOCK, INDEX(IX_Lineups_Status))
-                WHERE IsHome = 1
-                  AND ScrapingStatus = 'PENDING'
+                ;WITH PendingRows AS
+                (
+                    SELECT
+                        L.LineupId,
+                        L.MatchId,
+                        L.League,
+                        L.Season,
+                        L.MatchDate,
+                        L.Venue,
+                        L.Team,
+                        L.Opponent,
+                        L.IsHome,
+                        ROW_NUMBER() OVER
+                        (
+                            PARTITION BY L.MatchId
+                            ORDER BY
+                                CASE WHEN L.IsHome = 1 THEN 0 ELSE 1 END,
+                                L.LineupId DESC
+                        ) AS MatchRowRank
+                    FROM dbo.Lineups AS L WITH (UPDLOCK, READPAST, ROWLOCK, INDEX(IX_Lineups_Status))
+                    WHERE L.ScrapingStatus = 'PENDING'
+                )
+                INSERT INTO @ClaimedMatches (MatchId, RepresentativeLineupId)
+                SELECT TOP (@Take)
+                    P.MatchId,
+                    P.LineupId
+                FROM PendingRows AS P
+                WHERE P.MatchRowRank = 1
                 ORDER BY
                     CASE
-                        WHEN League LIKE '%2-bundesliga%' THEN 1
+                        WHEN P.League LIKE '%2-bundesliga%' THEN 1
                         ELSE 0
                     END,
                     CASE
-                        WHEN Team LIKE '%' + CHAR(10) + '%'
-                          OR Team LIKE '%' + CHAR(13) + '%'
-                          OR Opponent LIKE '%' + CHAR(10) + '%'
-                          OR Opponent LIKE '%' + CHAR(13) + '%'
-                          OR Team LIKE '% 2'
-                          OR Opponent LIKE '% 2'
+                        WHEN P.Team LIKE '%' + CHAR(10) + '%'
+                          OR P.Team LIKE '%' + CHAR(13) + '%'
+                          OR P.Opponent LIKE '%' + CHAR(10) + '%'
+                          OR P.Opponent LIKE '%' + CHAR(13) + '%'
+                          OR P.Team LIKE '% 2'
+                          OR P.Opponent LIKE '% 2'
                         THEN 1
                         ELSE 0
                     END,
-                    MatchDate DESC,
-                    LineupId DESC;
+                    P.MatchDate DESC,
+                    P.LineupId DESC;
 
                 UPDATE L
                 SET
                     ScrapingStatus = 'IN_PROGRESS'
-                OUTPUT
-                    inserted.LineupId,
-                    inserted.MatchId,
-                    inserted.League,
-                    inserted.Season,
-                    inserted.MatchDate,
-                    inserted.Venue,
-                    inserted.Team,
-                    inserted.Opponent,
-                    inserted.IsHome,
-                    inserted.Formation,
-                    inserted.Coach,
-                    inserted.SourceUrl,
-                    inserted.ScrapingStatus
                 FROM dbo.Lineups AS L
-                INNER JOIN @Claimed AS C
-                    ON C.LineupId = L.LineupId;
+                INNER JOIN @ClaimedMatches AS C
+                    ON C.MatchId = L.MatchId
+                WHERE L.ScrapingStatus = 'PENDING';
+
+                SELECT
+                    R.LineupId,
+                    R.MatchId,
+                    R.League,
+                    R.Season,
+                    R.MatchDate,
+                    R.Venue,
+                    R.Team,
+                    R.Opponent,
+                    R.IsHome,
+                    R.Formation,
+                    R.Coach,
+                    R.SourceUrl,
+                    R.ScrapingStatus
+                FROM dbo.Lineups AS R
+                INNER JOIN @ClaimedMatches AS C
+                    ON C.RepresentativeLineupId = R.LineupId;
             ", new { Take = take }, commandTimeout: 60);
 
             return rows.ToList();
@@ -413,6 +476,43 @@ namespace CornersMLData.Controllers
                 SourceUrl = sourceUrl,
                 HomeStatus = homeStatus,
                 AwayStatus = awayStatus
+            }, commandTimeout: 60);
+        }
+
+        private static async Task<int> RequeueMatchesByStatusAsync(SqlConnection conn, string fromStatus, int take)
+        {
+            return await conn.ExecuteAsync(@"
+                DECLARE @ClaimedMatches TABLE (MatchId INT PRIMARY KEY);
+
+                ;WITH CandidateMatches AS
+                (
+                    SELECT TOP (@Take)
+                        L.MatchId,
+                        MAX(L.MatchDate) AS MatchDate,
+                        MAX(L.LineupId) AS MaxLineupId
+                    FROM dbo.Lineups AS L WITH (UPDLOCK, READPAST, ROWLOCK, INDEX(IX_Lineups_Status))
+                    WHERE L.ScrapingStatus = @FromStatus
+                    GROUP BY L.MatchId
+                    ORDER BY
+                        MAX(L.MatchDate) DESC,
+                        MAX(L.LineupId) DESC
+                )
+                INSERT INTO @ClaimedMatches (MatchId)
+                SELECT MatchId
+                FROM CandidateMatches;
+
+                UPDATE L
+                SET
+                    ScrapingStatus = 'PENDING',
+                    LastScrapedAt = GETDATE()
+                FROM dbo.Lineups AS L
+                INNER JOIN @ClaimedMatches AS C
+                    ON C.MatchId = L.MatchId
+                WHERE L.ScrapingStatus = @FromStatus;
+            ", new
+            {
+                FromStatus = fromStatus,
+                Take = take
             }, commandTimeout: 60);
         }
 
@@ -890,6 +990,8 @@ namespace CornersMLData.Controllers
                 .Distinct()
                 .ToList();
 
+            var htmlSideFormations = ExtractSideSpecificFormationsFromHtml(html);
+
             // Intento 1: sacar team + formation desde headings/títulos visibles tipo:
             // Bor. Mönchengladbach (4-2-3-1)
             // Werder Bremen (3-4-2-1)
@@ -923,10 +1025,13 @@ namespace CornersMLData.Controllers
             string? homeFormation = null;
             string? awayFormation = null;
 
+            homeFormation = htmlSideFormations.HomeFormation;
+            awayFormation = htmlSideFormations.AwayFormation;
+
             if (teamFormationMap != null && teamFormationMap.Any())
             {
-                homeFormation = MatchFormationByTeamName(row.Team, teamFormationMap);
-                awayFormation = MatchFormationByTeamName(row.Opponent, teamFormationMap);
+                homeFormation ??= MatchFormationByTeamName(row.Team, teamFormationMap);
+                awayFormation ??= MatchFormationByTeamName(row.Opponent, teamFormationMap);
             }
 
             // Intento 2: fallback por orden si no matcheó por nombre
@@ -1796,6 +1901,178 @@ namespace CornersMLData.Controllers
             return best != null && best.Score > 0 ? best.Value : null;
         }
 
+        private static (string? HomeFormation, string? AwayFormation) ExtractSideSpecificFormationsFromHtml(string? html)
+        {
+            if (string.IsNullOrWhiteSpace(html))
+                return (null, null);
+
+            try
+            {
+                var doc = new HtmlDocument();
+                doc.LoadHtml(html);
+
+                var homeFormation = ExtractFormationFromSideHeaders(doc, "home")
+                    ?? InferFormationFromGraphicalLineup(doc, "home");
+
+                var awayFormation = ExtractFormationFromSideHeaders(doc, "away")
+                    ?? InferFormationFromGraphicalLineup(doc, "away");
+
+                return (homeFormation, awayFormation);
+            }
+            catch
+            {
+                return (null, null);
+            }
+        }
+
+        private static string? ExtractFormationFromSideHeaders(HtmlDocument doc, string side)
+        {
+            var xpath = side.Equals("home", StringComparison.OrdinalIgnoreCase)
+                ? "//h3[contains(@class,'hs-lineup-title') and contains(@class,'home')]"
+                  + " | //div[contains(@class,'hs-lineup--starter') and contains(@class,'home')]//h3[contains(@class,'hs-block-header')]"
+                : "//h3[contains(@class,'hs-lineup-title') and contains(@class,'away')]"
+                  + " | //div[contains(@class,'hs-lineup--starter') and contains(@class,'away')]//h3[contains(@class,'hs-block-header')]";
+
+            var nodes = doc.DocumentNode.SelectNodes(xpath);
+            if (nodes == null || nodes.Count == 0)
+                return null;
+
+            foreach (var node in nodes)
+            {
+                var text = HtmlEntity.DeEntitize(node.InnerText ?? "");
+                var formation = ExtractValidFormations(text).FirstOrDefault();
+                if (!string.IsNullOrWhiteSpace(formation))
+                    return formation;
+            }
+
+            return null;
+        }
+
+        private static string? InferFormationFromGraphicalLineup(HtmlDocument doc, string side)
+        {
+            var xpath = side.Equals("home", StringComparison.OrdinalIgnoreCase)
+                ? "//div[contains(@class,'hs-starter') and contains(@class,'home')]//div[contains(@class,'tactic') and contains(@class,'playing-lineup')]"
+                : "//div[contains(@class,'hs-starter') and contains(@class,'away')]//div[contains(@class,'tactic') and contains(@class,'playing-lineup')]";
+
+            var nodes = doc.DocumentNode.SelectNodes(xpath);
+            if (nodes == null || nodes.Count < 10)
+                return null;
+
+            var positions = new List<(double X, double Y)>();
+
+            foreach (var node in nodes)
+            {
+                var rawX = node.GetAttributeValue("data-xpos", "");
+                var rawY = node.GetAttributeValue("data-ypos", "");
+
+                if (!double.TryParse(rawX, NumberStyles.Float, CultureInfo.InvariantCulture, out var x)
+                    || !double.TryParse(rawY, NumberStyles.Float, CultureInfo.InvariantCulture, out var y))
+                    continue;
+
+                positions.Add((x, y));
+            }
+
+            if (positions.Count < 10)
+                return null;
+
+            positions = positions
+                .OrderBy(x => x.Y)
+                .ThenBy(x => x.X)
+                .ToList();
+
+            // The first marker is normally the goalkeeper; formations only describe the 10 outfield players.
+            while (positions.Count > 10)
+                positions.RemoveAt(0);
+
+            if (positions.Count != 10)
+                return null;
+
+            var commonFormations = new[]
+            {
+                "3-4-3", "3-5-2", "3-4-1-2", "3-4-2-1", "3-1-4-2", "3-2-4-1",
+                "4-4-2", "4-3-3", "4-5-1", "4-2-3-1", "4-1-4-1", "4-3-1-2",
+                "4-1-3-2", "4-2-2-2", "4-2-1-3", "4-1-2-1-2",
+                "5-3-2", "5-4-1", "5-2-3", "5-3-1-1", "5-2-2-1"
+            };
+
+            string? bestFormation = null;
+            var bestScore = double.MaxValue;
+
+            foreach (var candidate in commonFormations)
+            {
+                var rows = candidate.Split('-')
+                    .Select(int.Parse)
+                    .ToArray();
+
+                if (rows.Sum() != 10)
+                    continue;
+
+                var score = ScoreFormationCandidate(positions, rows);
+                if (score < bestScore)
+                {
+                    bestScore = score;
+                    bestFormation = candidate;
+                }
+            }
+
+            return bestFormation;
+        }
+
+        private static double ScoreFormationCandidate(List<(double X, double Y)> positions, int[] rows)
+        {
+            var score = 0.0;
+            var index = 0;
+            double? previousMaxY = null;
+
+            foreach (var rowSize in rows)
+            {
+                var row = positions.Skip(index).Take(rowSize).ToList();
+                if (row.Count != rowSize)
+                    return double.MaxValue;
+
+                var minY = row.Min(x => x.Y);
+                var maxY = row.Max(x => x.Y);
+                var minX = row.Min(x => x.X);
+                var maxX = row.Max(x => x.X);
+
+                score += (maxY - minY) * 2.0;
+                score += ScoreHorizontalSpreadPenalty(rowSize, maxX - minX);
+
+                if (previousMaxY.HasValue)
+                {
+                    var gap = Math.Max(0, minY - previousMaxY.Value);
+                    score -= Math.Min(gap, 0.35) * 0.4;
+                }
+
+                previousMaxY = maxY;
+                index += rowSize;
+            }
+
+            score += (rows.Length - 3) * 0.08;
+            return score;
+        }
+
+        private static double ScoreHorizontalSpreadPenalty(int rowSize, double spread)
+        {
+            var (min, max) = rowSize switch
+            {
+                1 => (0.00, 0.25),
+                2 => (0.20, 0.60),
+                3 => (0.35, 0.80),
+                4 => (0.50, 0.95),
+                5 => (0.65, 1.00),
+                _ => (0.00, 1.00)
+            };
+
+            if (spread < min)
+                return (min - spread) * 2.0;
+
+            if (spread > max)
+                return (spread - max) * 2.0;
+
+            return 0;
+        }
+
         private static List<string> ExtractCoachCandidates(string? text)
         {
             var list = new List<string>();
@@ -1939,6 +2216,15 @@ namespace CornersMLData.Controllers
             public int Errors { get; set; }
             public int Canceled { get; set; }
             public List<LineupProcessResult> Results { get; set; } = new();
+        }
+
+        public class RequeueBatchResponse
+        {
+            public string? Message { get; set; }
+            public string? FromStatus { get; set; }
+            public string? ToStatus { get; set; }
+            public int Requested { get; set; }
+            public int UpdatedRows { get; set; }
         }
 
         public class LineupProcessResult
